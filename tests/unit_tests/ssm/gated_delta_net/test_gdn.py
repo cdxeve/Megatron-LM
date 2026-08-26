@@ -78,6 +78,25 @@ def _set_gdn_test_cp_partition_mode(packed_seq_params, cp_size, linear_cp_mode):
     return packed_seq_params
 
 
+def _build_test_gdn(config, pg_collection):
+    gdn_submodules = get_experimental_attention_variant_module_spec(config=config).submodules
+    return (
+        GatedDeltaNet(
+            config,
+            submodules=gdn_submodules,
+            layer_number=1,
+            bias=False,
+            conv_bias=False,
+            conv_init=1.0,
+            use_qk_l2norm=True,
+            A_init_range=(1, 16),
+            pg_collection=pg_collection,
+        )
+        .cuda()
+        .bfloat16()
+    )
+
+
 def test_gdn_pre_gated_delta_rule_fusion_defaults_to_disabled():
     config = _make_gdn_config()
     assert not config.gdn_pre_gated_delta_rule_fusion
@@ -180,6 +199,76 @@ def test_gdn_headwise_cp_head_divisibility_includes_cp_size():
         )
 
 
+@pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+@pytest.mark.internal
+class TestGatedDeltaNetPackedIsolation:
+
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_method(self):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=1,
+        )
+        model_parallel_cuda_manual_seed(123)
+        pg_collection = ProcessGroupCollection(
+            tp=parallel_state.get_tensor_model_parallel_group(),
+            cp=parallel_state.get_context_parallel_group(),
+            tp_cp=parallel_state.get_tensor_and_context_parallel_group(),
+        )
+        self.gdn = _build_test_gdn(
+            _make_gdn_config(linear_conv_kernel_dim=4), pg_collection
+        )
+
+    def teardown_method(self):
+        Utils.destroy_model_parallel()
+
+    def test_sequence_boundary_isolation(self):
+        boundary = 5
+        total_tokens = 14
+        packed_seq_params = make_test_packed_seq_params(
+            cu_seqlens=[0, boundary, total_tokens]
+        )
+        torch.manual_seed(1234)
+        base_input = torch.randn(
+            (total_tokens, 1, self.gdn.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+        changed_input = base_input.clone()
+        changed_input[:boundary].normal_(mean=10.0, std=3.0)
+
+        def run(hidden_states):
+            self.gdn.zero_grad(set_to_none=True)
+            hidden_states = hidden_states.detach().clone().requires_grad_(True)
+            output, _ = self.gdn(
+                hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
+            )
+            output[boundary:].float().square().mean().backward()
+            return output.detach(), hidden_states.grad.detach()
+
+        base_output, base_grad = run(base_input)
+        changed_output, changed_grad = run(changed_input)
+
+        assert not torch.equal(changed_output[:boundary], base_output[:boundary])
+        torch.testing.assert_close(
+            changed_output[boundary:], base_output[boundary:], atol=0.0, rtol=0.0
+        )
+        torch.testing.assert_close(
+            base_grad[:boundary], torch.zeros_like(base_grad[:boundary]), atol=0.0, rtol=0.0
+        )
+        torch.testing.assert_close(
+            changed_grad[:boundary],
+            torch.zeros_like(changed_grad[:boundary]),
+            atol=0.0,
+            rtol=0.0,
+        )
+        torch.testing.assert_close(
+            changed_grad[boundary:], base_grad[boundary:], atol=0.0, rtol=0.0
+        )
+        assert torch.count_nonzero(base_grad[boundary:]) > 0
+
+
 @pytest.mark.parametrize(
     ("tp_size", "sp", "cp_size", "linear_cp_mode"),
     [
@@ -256,22 +345,7 @@ class TestGatedDeltaNet:
             linear_cp_mode=self.linear_cp_mode,
             transformer_impl="transformer_engine",
         )
-        gdn_submodules = get_experimental_attention_variant_module_spec(
-            config=self.transformer_config
-        ).submodules
-
-        self.gdn = GatedDeltaNet(
-            self.transformer_config,
-            submodules=gdn_submodules,
-            layer_number=1,
-            bias=False,
-            conv_bias=False,
-            conv_init=1.0,
-            use_qk_l2norm=True,
-            A_init_range=(1, 16),
-            pg_collection=pg_collection,
-        )
-        self.gdn = self.gdn.cuda().bfloat16()
+        self.gdn = _build_test_gdn(self.transformer_config, pg_collection)
 
     def teardown_method(self):
         Utils.destroy_model_parallel()
